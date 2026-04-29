@@ -5,19 +5,13 @@ const TARGET_DOMAIN = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 const SECRET_PATH = "/api/v1/chat/conversation/authenticated";
 const PORT = process.env.PORT || 3000;
 
-const STRIP_HEADERS = new Set([
-  "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-  "te", "trailer", "transfer-encoding", "upgrade", "forwarded",
-  "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
-  "server", "via"
-]);
-
 const server = http.createServer((req, res) => {
   if (!TARGET_DOMAIN) {
     res.writeHead(503, { "Content-Type": "text/plain" });
     return res.end("Service Unavailable: TARGET_DOMAIN not configured.");
   }
 
+  // مخفی‌سازی مسیر
   if (!req.url.startsWith(SECRET_PATH)) {
     if (req.url === "/" || req.url === "") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -32,44 +26,22 @@ const server = http.createServer((req, res) => {
     const isHttps = targetUrl.protocol === 'https:';
     const requestModule = isHttps ? https : http;
 
+    // کپی کردن تمام هدرها بدون دستکاری برای حفظ یکپارچگی استریم XHTTP
     const options = {
       hostname: targetUrl.hostname,
       port: targetUrl.port || (isHttps ? 443 : 80),
       path: targetUrl.pathname + targetUrl.search,
       method: req.method,
-      headers: {},
+      headers: { ...req.headers },
       rejectUnauthorized: false 
     };
 
-    let clientIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim();
-
-    for (const [key, value] of Object.entries(req.headers)) {
-      const k = key.toLowerCase();
-      
-      if (STRIP_HEADERS.has(k) || k.startsWith("cf-") || k.startsWith("x-railway-")) continue;
-
-      if (k === "user-agent") {
-        options.headers[k] = value || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
-        continue;
-      }
-
-      options.headers[k] = value;
-    }
-
+    // فقط هدر Host را برای فایروال سرور مقصد تغییر می‌دهیم
     options.headers["Host"] = targetUrl.hostname;
-    if (clientIp) options.headers["X-Forwarded-For"] = clientIp;
-    options.headers["X-Forwarded-Proto"] = "https";
 
     const proxyReq = requestModule.request(options, (proxyRes) => {
-      const responseHeaders = { ...proxyRes.headers };
-      
-      delete responseHeaders["server"];
-      delete responseHeaders["x-powered-by"];
-      delete responseHeaders["via"];
-      delete responseHeaders["transfer-encoding"];
-
-      res.writeHead(proxyRes.statusCode, responseHeaders);
-      proxyRes.pipe(res);
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res, { end: true });
     });
 
     proxyReq.on("error", (err) => {
@@ -80,7 +52,12 @@ const server = http.createServer((req, res) => {
       }
     });
 
-    req.pipe(proxyReq);
+    // مدیریت قطع شدن ناگهانی کلاینت برای جلوگیری از کرش کردن سرور
+    req.on("error", () => proxyReq.destroy());
+    req.on("aborted", () => proxyReq.destroy());
+
+    // انتقال جریان داده‌ها به سرور اصلی
+    req.pipe(proxyReq, { end: true });
 
   } catch (error) {
     console.error("Internal Server Error:", error);
