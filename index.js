@@ -17,6 +17,10 @@ const STRIP_RES_HEADERS = new Set([
 ]);
 
 const server = http.createServer((req, res) => {
+  req.socket.setTimeout(0);
+  req.socket.setNoDelay(true);
+  req.socket.setKeepAlive(true);
+
   let url;
   try {
     url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -25,7 +29,6 @@ const server = http.createServer((req, res) => {
     return res.end("Bad Request");
   }
 
-  // Health check
   if (url.pathname === "/" || url.pathname === "") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     return res.end(`<!DOCTYPE html><html lang="fa"><head><meta charset="utf-8"><title>Service</title></head><body><h1>Service Running</h1><p>Authentication required.</p></body></html>`);
@@ -41,7 +44,6 @@ const server = http.createServer((req, res) => {
     return res.end("Not Found");
   }
 
-  // Build target URL
   let targetUrl;
   try {
     targetUrl = new URL(`${TARGET_BASE}${url.pathname}${url.search}`);
@@ -50,7 +52,6 @@ const server = http.createServer((req, res) => {
     return res.end("Bad Gateway - Invalid target URL");
   }
 
-  // Build forwarded headers
   const outHeaders = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const k = key.toLowerCase();
@@ -72,11 +73,16 @@ const server = http.createServer((req, res) => {
     path: `${targetUrl.pathname}${targetUrl.search}`,
     method: req.method,
     headers: outHeaders,
-    timeout: 30000,
+    timeout: 0,
   };
 
   const proxyReq = lib.request(options, (proxyRes) => {
-    // Clean response headers
+    if (proxyRes.socket) {
+      proxyRes.socket.setTimeout(0);
+      proxyRes.socket.setNoDelay(true);
+      proxyRes.socket.setKeepAlive(true);
+    }
+
     const resHeaders = {};
     for (const [key, value] of Object.entries(proxyRes.headers)) {
       const k = key.toLowerCase();
@@ -85,17 +91,16 @@ const server = http.createServer((req, res) => {
     }
 
     res.writeHead(proxyRes.statusCode || 502, resHeaders);
+
+    proxyRes.on('error', (err) => {
+      console.error("Upstream response error:", err.message);
+      if (!res.writableEnded) res.end();
+    });
+
     proxyRes.pipe(res, { end: true });
   });
 
-  proxyReq.on('timeout', () => {
-    console.error("Relay Error: upstream request timed out");
-    proxyReq.destroy();
-    if (!res.headersSent) {
-      res.writeHead(504, { "Content-Type": "text/plain" });
-      res.end("Gateway Timeout");
-    }
-  });
+  proxyReq.setTimeout(0);
 
   proxyReq.on('error', (err) => {
     console.error("Relay Error:", err.message);
@@ -105,8 +110,21 @@ const server = http.createServer((req, res) => {
     }
   });
 
+  req.on('error', (err) => {
+    console.error("Client request error:", err.message);
+    proxyReq.destroy();
+  });
+
+  res.on('close', () => {
+    proxyReq.destroy();
+  });
+
   req.pipe(proxyReq, { end: true });
 });
+
+server.timeout = 0;
+server.keepAliveTimeout = 0;
+server.headersTimeout = 0;
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ XHTTP Relay is running on port ${PORT}`);
