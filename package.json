@@ -2,9 +2,8 @@
   "name": "railway-xhttp-relay",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node --no-warnings index.js"
   },
   "engines": {
     "node": ">=18"
