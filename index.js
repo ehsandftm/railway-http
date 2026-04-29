@@ -1,132 +1,96 @@
-import http from 'node:http';
-import https from 'node:https';
-import { URL } from 'node:url';
+const http = require('http');
+const https = require('https');
 
-const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
-const PORT = process.env.PORT || 3000;
+const TARGET_DOMAIN = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 const SECRET_PATH = "/api/v1/chat/conversation/authenticated";
+const PORT = process.env.PORT || 3000;
 
-const STRIP_REQ_HEADERS = new Set([
+const STRIP_HEADERS = new Set([
   "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade", "forwarded",
-  "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port", "via"
-]);
-
-const STRIP_RES_HEADERS = new Set([
-  "server", "x-powered-by", "via", "transfer-encoding", "connection"
+  "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
+  "server", "via"
 ]);
 
 const server = http.createServer((req, res) => {
-  req.socket.setTimeout(0);
-  req.socket.setNoDelay(true);
-  req.socket.setKeepAlive(true);
-
-  let url;
-  try {
-    url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  } catch {
-    res.writeHead(400, { "Content-Type": "text/plain" });
-    return res.end("Bad Request");
-  }
-
-  if (url.pathname === "/" || url.pathname === "") {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    return res.end(`<!DOCTYPE html><html lang="fa"><head><meta charset="utf-8"><title>Service</title></head><body><h1>Service Running</h1><p>Authentication required.</p></body></html>`);
-  }
-
-  if (!TARGET_BASE) {
+  if (!TARGET_DOMAIN) {
     res.writeHead(503, { "Content-Type": "text/plain" });
-    return res.end("Service Unavailable - TARGET_DOMAIN not set");
+    return res.end("Service Unavailable: TARGET_DOMAIN not configured.");
   }
 
-  if (!url.pathname.startsWith(SECRET_PATH)) {
+  if (!req.url.startsWith(SECRET_PATH)) {
+    if (req.url === "/" || req.url === "") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(`<!DOCTYPE html><html><head><title>System OK</title></head><body><h1>All Systems Operational</h1></body></html>`);
+    }
     res.writeHead(404, { "Content-Type": "text/plain" });
     return res.end("Not Found");
   }
 
-  let targetUrl;
   try {
-    targetUrl = new URL(`${TARGET_BASE}${url.pathname}${url.search}`);
-  } catch {
-    res.writeHead(502, { "Content-Type": "text/plain" });
-    return res.end("Bad Gateway - Invalid target URL");
-  }
+    const targetUrl = new URL(TARGET_DOMAIN + req.url);
+    const isHttps = targetUrl.protocol === 'https:';
+    const requestModule = isHttps ? https : http;
 
-  const outHeaders = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    const k = key.toLowerCase();
-    if (STRIP_REQ_HEADERS.has(k)) continue;
-    outHeaders[k] = Array.isArray(value) ? value.join(", ") : value;
-  }
+    const options = {
+      hostname: targetUrl.hostname,
+      port: targetUrl.port || (isHttps ? 443 : 80),
+      path: targetUrl.pathname + targetUrl.search,
+      method: req.method,
+      headers: {},
+      rejectUnauthorized: false 
+    };
 
-  const clientIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress;
-  if (clientIp) outHeaders["x-forwarded-for"] = clientIp;
-  outHeaders["x-forwarded-proto"] = "https";
-  outHeaders["host"] = targetUrl.host;
+    let clientIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim();
 
-  const isHttps = targetUrl.protocol === "https:";
-  const lib = isHttps ? https : http;
-
-  const options = {
-    hostname: targetUrl.hostname,
-    port: targetUrl.port || (isHttps ? 443 : 80),
-    path: `${targetUrl.pathname}${targetUrl.search}`,
-    method: req.method,
-    headers: outHeaders,
-    timeout: 0,
-  };
-
-  const proxyReq = lib.request(options, (proxyRes) => {
-    if (proxyRes.socket) {
-      proxyRes.socket.setTimeout(0);
-      proxyRes.socket.setNoDelay(true);
-      proxyRes.socket.setKeepAlive(true);
-    }
-
-    const resHeaders = {};
-    for (const [key, value] of Object.entries(proxyRes.headers)) {
+    for (const [key, value] of Object.entries(req.headers)) {
       const k = key.toLowerCase();
-      if (STRIP_RES_HEADERS.has(k)) continue;
-      resHeaders[k] = value;
+      
+      if (STRIP_HEADERS.has(k) || k.startsWith("cf-") || k.startsWith("x-railway-")) continue;
+
+      if (k === "user-agent") {
+        options.headers[k] = value || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+        continue;
+      }
+
+      options.headers[k] = value;
     }
 
-    res.writeHead(proxyRes.statusCode || 502, resHeaders);
+    options.headers["Host"] = targetUrl.hostname;
+    if (clientIp) options.headers["X-Forwarded-For"] = clientIp;
+    options.headers["X-Forwarded-Proto"] = "https";
 
-    proxyRes.on('error', (err) => {
-      console.error("Upstream response error:", err.message);
-      if (!res.writableEnded) res.end();
+    const proxyReq = requestModule.request(options, (proxyRes) => {
+      const responseHeaders = { ...proxyRes.headers };
+      
+      delete responseHeaders["server"];
+      delete responseHeaders["x-powered-by"];
+      delete responseHeaders["via"];
+      delete responseHeaders["transfer-encoding"];
+
+      res.writeHead(proxyRes.statusCode, responseHeaders);
+      proxyRes.pipe(res);
     });
 
-    proxyRes.pipe(res, { end: true });
-  });
+    proxyReq.on("error", (err) => {
+      console.error("Upstream Relay Error:", err.message);
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end("Bad Gateway");
+      }
+    });
 
-  proxyReq.setTimeout(0);
+    req.pipe(proxyReq);
 
-  proxyReq.on('error', (err) => {
-    console.error("Relay Error:", err.message);
+  } catch (error) {
+    console.error("Internal Server Error:", error);
     if (!res.headersSent) {
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end("Bad Gateway - Tunnel Failed");
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.end("Internal Error");
     }
-  });
-
-  req.on('error', (err) => {
-    console.error("Client request error:", err.message);
-    proxyReq.destroy();
-  });
-
-  res.on('close', () => {
-    proxyReq.destroy();
-  });
-
-  req.pipe(proxyReq, { end: true });
+  }
 });
 
-server.timeout = 0;
-server.keepAliveTimeout = 0;
-server.headersTimeout = 0;
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ XHTTP Relay is running on port ${PORT}`);
-  console.log(`TARGET_BASE: ${TARGET_BASE}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Railway Relay Service is running on port ${PORT}`);
 });
