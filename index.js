@@ -1,4 +1,5 @@
 import http from 'node:http';
+import https from 'node:https';
 
 const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 const PORT = process.env.PORT || 3000;
@@ -24,7 +25,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       return res.end(`<!DOCTYPE html><html lang="fa"><head><meta charset="utf-8"><title>Service</title></head><body><h1>Service Running</h1><p>Authentication required.</p></body></html>`);
     }
-    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.writeHead(404);
     return res.end("Not Found");
   }
 
@@ -48,47 +49,49 @@ const server = http.createServer(async (req, res) => {
     if (clientIp) headers["x-forwarded-for"] = clientIp;
     headers["x-forwarded-proto"] = "https";
 
-    const hasBody = req.method !== "GET" && req.method !== "HEAD";
+    const method = req.method;
+    const hasBody = method !== "GET" && method !== "HEAD";
 
+    // روش ساده‌تر و پایدارتر برای Railway
     const fetchOptions = {
-      method: req.method,
-      headers: headers,
+      method,
+      headers,
       redirect: "manual",
     };
 
     if (hasBody) {
-      // روش بهتر برای Railway / Node.js
+      // تبدیل req به stream به صورت ایمن‌تر
       fetchOptions.body = req;
       fetchOptions.duplex = "half";
     }
 
     const upstream = await fetch(targetUrl, fetchOptions);
 
-    // کپی هدرها
-    res.writeHead(upstream.status || 502, Object.fromEntries(upstream.headers.entries()));
+    res.writeHead(upstream.status || 502, Object.fromEntries(upstream.headers));
 
-    // حذف هدرهای شناسایی‌کننده
     res.removeHeader("server");
     res.removeHeader("x-powered-by");
     res.removeHeader("via");
 
-    // Streaming پاسخ
     if (upstream.body) {
+      // روش streaming ایمن‌تر با for await
       for await (const chunk of upstream.body) {
         res.write(chunk);
       }
     }
+
     res.end();
 
   } catch (err) {
     console.error("Relay Error:", err.message);
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end("Bad Gateway");
+      res.end("Bad Gateway - Tunnel Failed");
     }
   }
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ XHTTP Relay listening on port ${PORT}`);
+  console.log(`✅ XHTTP Relay is running on port ${PORT}`);
+  console.log(`TARGET_BASE: ${TARGET_BASE}`);
 });
