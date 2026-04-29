@@ -12,30 +12,27 @@ const STRIP_HEADERS = new Set([
 ]);
 
 const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  if (!TARGET_BASE) {
+    res.writeHead(503, { "Content-Type": "text/plain" });
+    return res.end("Service Unavailable - TARGET_DOMAIN not set");
+  }
+
+  if (!url.pathname.startsWith(SECRET_PATH)) {
+    if (url.pathname === "/" || url.pathname === "") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(`<!DOCTYPE html><html lang="fa"><head><meta charset="utf-8"><title>Service</title></head><body><h1>Service Running</h1><p>Authentication required.</p></body></html>`);
+    }
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    return res.end("Not Found");
+  }
+
   try {
-    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-
-    // اگر TARGET_DOMAIN تنظیم نشده
-    if (!TARGET_BASE) {
-      res.writeHead(503, { "Content-Type": "text/plain" });
-      return res.end("Service Unavailable");
-    }
-
-    // فقط مسیر خاص را پردازش کن
-    if (!url.pathname.startsWith(SECRET_PATH)) {
-      if (url.pathname === "/" || url.pathname === "") {
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        return res.end(`<!DOCTYPE html><html lang="fa"><head><meta charset="utf-8"><title>Service</title></head><body><h1>Service Running</h1><p>Authentication required.</p></body></html>`);
-      }
-      res.writeHead(404, { "Content-Type": "text/plain" });
-      return res.end("Not Found");
-    }
-
-    // ساخت URL هدف
-    const targetUrl = TARGET_DOMAIN + url.pathname + url.search;
+    const targetUrl = `${TARGET_BASE}${url.pathname}${url.search}`;
 
     const headers = {};
-    let clientIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress;
+    let clientIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim();
 
     for (const [key, value] of Object.entries(req.headers)) {
       const k = key.toLowerCase();
@@ -51,37 +48,34 @@ const server = http.createServer(async (req, res) => {
     if (clientIp) headers["x-forwarded-for"] = clientIp;
     headers["x-forwarded-proto"] = "https";
 
-    const method = req.method;
-    const hasBody = method !== "GET" && method !== "HEAD";
+    const hasBody = req.method !== "GET" && req.method !== "HEAD";
 
     const fetchOptions = {
-      method,
-      headers,
-      redirect: "manual"
+      method: req.method,
+      headers: headers,
+      redirect: "manual",
     };
 
     if (hasBody) {
-      fetchOptions.body = req;           // در Node.js http.IncomingMessage
+      // روش بهتر برای Railway / Node.js
+      fetchOptions.body = req;
       fetchOptions.duplex = "half";
     }
 
     const upstream = await fetch(targetUrl, fetchOptions);
 
-    // ارسال هدرها
-    res.writeHead(upstream.status || 502, Object.fromEntries(upstream.headers));
+    // کپی هدرها
+    res.writeHead(upstream.status || 502, Object.fromEntries(upstream.headers.entries()));
 
-    // پاک کردن هدرهای شناسایی‌کننده
+    // حذف هدرهای شناسایی‌کننده
     res.removeHeader("server");
     res.removeHeader("x-powered-by");
     res.removeHeader("via");
 
-    // streaming پاسخ
+    // Streaming پاسخ
     if (upstream.body) {
-      const reader = upstream.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        res.write(value);
+      for await (const chunk of upstream.body) {
+        res.write(chunk);
       }
     }
     res.end();
@@ -96,5 +90,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`XHTTP Relay running on port ${PORT}`);
+  console.log(`✅ XHTTP Relay listening on port ${PORT}`);
 });
