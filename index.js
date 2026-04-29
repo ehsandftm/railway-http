@@ -1,101 +1,94 @@
-const http = require('http');
-const https = require('https');
+import http from 'node:http';
 
-const TARGET_DOMAIN = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
-const SECRET_PATH = "/api/v1/chat/conversation/authenticated";
+const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 const PORT = process.env.PORT || 3000;
+const SECRET_PATH = "/api/v1/chat/conversation/authenticated";
 
-// ساخت یک Agent اختصاصی برای جلوگیری از قطع شدن استریم‌ها و تایم‌اوت
-const httpsAgent = new https.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 10000,
-  timeout: 60000,
-  rejectUnauthorized: false
-});
+const STRIP_HEADERS = new Set([
+  "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+  "te", "trailer", "transfer-encoding", "upgrade", "forwarded",
+  "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
+  "server", "x-powered-by", "via"
+]);
 
-const server = http.createServer((req, res) => {
-  if (!TARGET_DOMAIN) {
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  if (!TARGET_BASE) {
     res.writeHead(503, { "Content-Type": "text/plain" });
-    return res.end("Service Unavailable: TARGET_DOMAIN not configured.");
+    return res.end("Service Unavailable - TARGET_DOMAIN not set");
   }
 
-  // مخفی‌سازی مسیر
-  if (!req.url.startsWith(SECRET_PATH)) {
-    if (req.url === "/" || req.url === "") {
+  if (!url.pathname.startsWith(SECRET_PATH)) {
+    if (url.pathname === "/" || url.pathname === "") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      return res.end(`<!DOCTYPE html><html><head><title>System OK</title></head><body><h1>All Systems Operational</h1></body></html>`);
+      return res.end(`<!DOCTYPE html><html lang="fa"><head><meta charset="utf-8"><title>Service</title></head><body><h1>Service Running</h1><p>Authentication required.</p></body></html>`);
     }
     res.writeHead(404, { "Content-Type": "text/plain" });
     return res.end("Not Found");
   }
 
   try {
-    const targetUrl = new URL(TARGET_DOMAIN + req.url);
-    
-    // کانفیگ درخواست به سمت سرور اصلی شما
-    const options = {
-      hostname: targetUrl.hostname,
-      port: targetUrl.port || 443,
-      path: targetUrl.pathname + targetUrl.search,
-      method: req.method,
-      agent: httpsAgent,
-      headers: {}
-    };
+    const targetUrl = `${TARGET_BASE}${url.pathname}${url.search}`;
 
-    // کپی کردن هدرها و اضافه کردن هدرهای حیاتی برای گول زدن فایروال
+    const headers = {};
+    let clientIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim();
+
     for (const [key, value] of Object.entries(req.headers)) {
       const k = key.toLowerCase();
-      if (k !== 'host' && k !== 'connection' && k !== 'keep-alive') {
-        options.headers[k] = value;
+      if (STRIP_HEADERS.has(k)) continue;
+
+      if (k === "user-agent") {
+        headers[key] = value || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+        continue;
       }
+      headers[key] = Array.isArray(value) ? value.join(", ") : value;
     }
 
-    options.headers["Host"] = targetUrl.hostname;
-    // اجبار به استفاده از Connection: keep-alive برای زنده نگه داشتن XHTTP
-    options.headers["Connection"] = "keep-alive";
-    
-    const clientIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
-    if (clientIp) options.headers["X-Forwarded-For"] = clientIp.split(',')[0].trim();
-    options.headers["X-Forwarded-Proto"] = "https";
+    if (clientIp) headers["x-forwarded-for"] = clientIp;
+    headers["x-forwarded-proto"] = "https";
 
-    const proxyReq = https.request(options, (proxyRes) => {
-      const resHeaders = { ...proxyRes.headers };
-      delete resHeaders["server"];
-      delete resHeaders["x-powered-by"];
+    const hasBody = req.method !== "GET" && req.method !== "HEAD";
 
-      res.writeHead(proxyRes.statusCode, resHeaders);
-      res.flushHeaders(); 
-      proxyRes.pipe(res);
-    });
+    const fetchOptions = {
+      method: req.method,
+      headers: headers,
+      redirect: "manual",
+    };
 
-    // مدیریت خطای تایم‌اوت و 502 که در لاگ‌ها داشتی
-    proxyReq.on("error", (err) => {
-      console.error("Upstream Error:", err.message);
-      if (!res.headersSent) {
-        // اگر خطای تایم‌اوت داد، 504 برگردان تا فرقش با 502 مشخص شود
-        res.writeHead(err.code === 'ETIMEDOUT' ? 504 : 502, { "Content-Type": "text/plain" });
-        res.end("Gateway Error: " + err.message);
+    if (hasBody) {
+      // روش بهتر برای Railway / Node.js
+      fetchOptions.body = req;
+      fetchOptions.duplex = "half";
+    }
+
+    const upstream = await fetch(targetUrl, fetchOptions);
+
+    // کپی هدرها
+    res.writeHead(upstream.status || 502, Object.fromEntries(upstream.headers.entries()));
+
+    // حذف هدرهای شناسایی‌کننده
+    res.removeHeader("server");
+    res.removeHeader("x-powered-by");
+    res.removeHeader("via");
+
+    // Streaming پاسخ
+    if (upstream.body) {
+      for await (const chunk of upstream.body) {
+        res.write(chunk);
       }
-    });
+    }
+    res.end();
 
-    req.on("error", () => proxyReq.destroy());
-    req.on("aborted", () => proxyReq.destroy());
-
-    proxyReq.flushHeaders();
-    req.pipe(proxyReq);
-
-  } catch (error) {
-    console.error("Internal Server Error:", error);
+  } catch (err) {
+    console.error("Relay Error:", err.message);
     if (!res.headersSent) {
-      res.writeHead(500, { "Content-Type": "text/plain" });
-      res.end("Internal Error");
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end("Bad Gateway");
     }
   }
 });
 
-process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
-process.on('unhandledRejection', (err) => console.error('Unhandled Rejection:', err));
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Railway Relay Service is running on port ${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ XHTTP Relay listening on port ${PORT}`);
 });
